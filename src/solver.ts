@@ -147,7 +147,7 @@
 import { type Arith, type Bool, init } from "z3-solver";
 import { killThreads } from "./utils";
 
-async function checker(args: Operations, user?: any) {
+async function checker(args: RangeFilter, user?: any) {
   const { Context, em } = await init();
   const { Solver, Int, Or, And } = Context("main");
   const userAge = Int.const("user.age"); // to generate dynamically
@@ -155,7 +155,7 @@ async function checker(args: Operations, user?: any) {
   const variables = { userAge, alcoholLevel }; // to generate dynamically
   const solver = new Solver();
   solver.add(
-    ...buildZ3VariablesFromArgs(variables, args, user),
+    ...buildAssertions(variables, args, user),
     Or(userAge.ge(18), And(userAge.ge(16), alcoholLevel.lt(5))) // to generate dynamically
   );
   if ((await solver.check()) === "sat") {
@@ -172,79 +172,81 @@ async function checker(args: Operations, user?: any) {
 }
 
 type Operator = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
-type Operations = Record<string, Partial<{ [k in Operator]: number }> | number>;
+type NumericComparison = Partial<{ [k in Operator]: number }>;
+type NumericCondition = NumericComparison | number;
+type RangeFilter = Record<string, NumericCondition>;
+type Assertion = Bool<"main">;
+type NumberExpr = Arith<"main">;
 
-const processPropertyOperations = (
-  variable: Arith<"main">,
-  propertyOperations: Operations[keyof Operations],
-  newVariables: Bool<"main">[]
-) => {
-  if (typeof propertyOperations === "number") {
-    newVariables.push(variable.eq(propertyOperations));
+const processCondition = (
+  variable: NumberExpr,
+  condition: NumericCondition
+): Assertion[] => {
+  const assertions: Assertion[] = [];
+  if (typeof condition === "number") {
+    assertions.push(variable.eq(condition));
   } else {
-    for (const [operator, value] of Object.entries(propertyOperations)) {
+    for (const [operator, value] of Object.entries(condition)) {
       switch (operator) {
         case "eq":
-          newVariables.push(variable.eq(value));
+          assertions.push(variable.eq(value));
           break;
         case "ne":
-          newVariables.push(variable.neq(value));
+          assertions.push(variable.neq(value));
           break;
         case "lt":
-          newVariables.push(variable.lt(value));
+          assertions.push(variable.lt(value));
           break;
         case "le":
-          newVariables.push(variable.le(value));
+          assertions.push(variable.le(value));
           break;
         case "gt":
-          newVariables.push(variable.gt(value));
+          assertions.push(variable.gt(value));
           break;
         case "ge":
-          newVariables.push(variable.ge(value));
+          assertions.push(variable.ge(value));
           break;
         default:
           throw new Error("Invalid operator");
       }
     }
   }
+  return assertions;
 };
 
-const processProperties = (
-  variables: Record<string, Arith<"main">>,
-  args: Operations,
-  newVariables: Bool<"main">[],
-  isUser: boolean
-) => {
-  for (const [property, propertyOperations] of Object.entries(args)) {
-    const variableRegistry = {} as Record<string, Arith<"main">>;
-    for (const name in variables) {
-      const realName = variables[name].name() as string;
-      variableRegistry[realName] = variables[name];
-    }
-    const variable = isUser
-      ? variableRegistry[`user.${property}`]
-      : variableRegistry[property];
+const processFilters = (
+  variables: Record<string, NumberExpr>,
+  filter: RangeFilter,
+  isUserFilter: boolean = false
+): Assertion[] => {
+  for (const [property, condition] of Object.entries(filter)) {
+    const renamedProperty = isUserFilter ? `user.${property}` : property;
+    const variable = variables[renamedProperty];
     if (variable) {
-      processPropertyOperations(variable, propertyOperations, newVariables);
+      return processCondition(variable, condition);
     }
   }
+  return [];
 };
 
-const buildZ3VariablesFromArgs = (
-  variables: Record<string, Arith<"main">>,
-  args: Operations,
-  user?: Operations
+const buildAssertions = (
+  variables: Record<string, NumberExpr>,
+  args: RangeFilter = {},
+  user: RangeFilter = {}
 ) => {
-  const newVariables: Bool<"main">[] = [];
-  processProperties(variables, args, newVariables, false);
-  if (user) {
-    processProperties(variables, user, newVariables, true);
+  const variableRegistry = {} as Record<string, NumberExpr>;
+  for (const name in variables) {
+    const realName = variables[name].name() as string;
+    variableRegistry[realName] = variables[name];
   }
+  const argsAssertions = processFilters(variableRegistry, args);
+  const userAssertions = processFilters(variableRegistry, user, true);
+  const assertions = [...argsAssertions, ...userAssertions];
   console.log(
-    "newVariables",
-    newVariables.map((v) => v.toString())
+    "assertions",
+    assertions.map((a) => a.toString())
   );
-  return newVariables;
+  return assertions;
 };
 
 // ###############    TESTS     ###############
