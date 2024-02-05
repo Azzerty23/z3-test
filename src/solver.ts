@@ -388,9 +388,9 @@ const result9 = await checker(
   {
     OR: [
       { alcoholLevel: 0, inStock: false },
-      { alcoholLevel: 100, inStock: true, "user.age": { lt: 18 } },
+      { inStock: true, "user.age": { lt: 18 } }, // override user age condition
     ],
-  }
-  // { age: 16 } // age should not be in policy in the first place
+  },
+  { age: 20 }
 );
 console.log("result9", result9); // false
