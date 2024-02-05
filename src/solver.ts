@@ -147,15 +147,17 @@
 import { type Arith, type Bool, init } from "z3-solver";
 import { killThreads } from "./utils";
 
-async function checker(args: RangeFilter, user?: any) {
+async function checker(args: Filter, user?: any) {
   const { Context, em } = await init();
   const { Solver, Int, Or, And } = Context("main");
   const userAge = Int.const("user.age"); // to generate dynamically
   const alcoholLevel = Int.const("alcoholLevel"); // to generate dynamically
   const variables = { userAge, alcoholLevel }; // to generate dynamically
   const solver = new Solver();
+  console.log("args", args);
+  const assertions = buildAssertions(variables, Or, And, args, user);
+  solver.add(...assertions);
   solver.add(
-    ...buildAssertions(variables, args, user),
     Or(userAge.ge(18), And(userAge.ge(16), alcoholLevel.lt(5))) // to generate dynamically
   );
   if ((await solver.check()) === "sat") {
@@ -174,73 +176,105 @@ async function checker(args: RangeFilter, user?: any) {
 type Operator = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 type NumericComparison = Partial<{ [k in Operator]: number }>;
 type NumericCondition = NumericComparison | number;
-type RangeFilter = Record<string, NumericCondition>;
+type OrCondition = { OR: NumericCondition[] | OrCondition[] };
+type RangeFilter = Record<string, OrCondition | NumericCondition>;
+type OrFilter = { OR: RangeFilter[] | OrFilter[] };
+type Filter = RangeFilter | OrFilter;
 type Assertion = Bool<"main">;
 type NumberExpr = Arith<"main">;
 
 const processCondition = (
   variable: NumberExpr,
-  condition: NumericCondition
+  condition: NumericCondition | OrCondition,
+  Or: (...args: Assertion[]) => Assertion,
+  And: (...args: Assertion[]) => Assertion
 ): Assertion[] => {
   const assertions: Assertion[] = [];
   if (typeof condition === "number") {
     assertions.push(variable.eq(condition));
+  } // handle OR condition
+  else if ("OR" in condition) {
+    const orCondition = condition as OrCondition;
+    const tempAssertions: Assertion[] = [];
+    for (const condition of orCondition.OR) {
+      tempAssertions.push(...processCondition(variable, condition, Or, And));
+    }
+    const orAssertion = Or(...tempAssertions);
+    assertions.push(orAssertion);
   } else {
+    const tempAssertions: Assertion[] = [];
     for (const [operator, value] of Object.entries(condition)) {
       switch (operator) {
         case "eq":
-          assertions.push(variable.eq(value));
+          tempAssertions.push(variable.eq(value));
           break;
         case "ne":
-          assertions.push(variable.neq(value));
+          tempAssertions.push(variable.neq(value));
           break;
         case "lt":
-          assertions.push(variable.lt(value));
+          tempAssertions.push(variable.lt(value));
           break;
         case "le":
-          assertions.push(variable.le(value));
+          tempAssertions.push(variable.le(value));
           break;
         case "gt":
-          assertions.push(variable.gt(value));
+          tempAssertions.push(variable.gt(value));
           break;
         case "ge":
-          assertions.push(variable.ge(value));
+          tempAssertions.push(variable.ge(value));
           break;
         default:
           throw new Error("Invalid operator");
       }
     }
+    const andAssertion = And(...tempAssertions);
+    assertions.push(andAssertion);
   }
   return assertions;
 };
 
-const processFilters = (
+const processFilter = (
   variables: Record<string, NumberExpr>,
-  filter: RangeFilter,
+  Or: (...args: Assertion[]) => Assertion,
+  And: (...args: Assertion[]) => Assertion,
+  filter: Filter,
   isUserFilter: boolean = false
 ): Assertion[] => {
+  const assertions: Assertion[] = [];
+  if ("OR" in filter) {
+    const orFilter = filter as OrFilter;
+    console.log("orFilter", orFilter.OR);
+    const tempAssertions: Assertion[] = [];
+    for (const filter of orFilter.OR) {
+      tempAssertions.push(...processFilter(variables, Or, And, filter));
+    }
+    const orAssertion = Or(...tempAssertions);
+    assertions.push(orAssertion);
+  }
   for (const [property, condition] of Object.entries(filter)) {
     const renamedProperty = isUserFilter ? `user.${property}` : property;
     const variable = variables[renamedProperty];
     if (variable) {
-      return processCondition(variable, condition);
+      assertions.push(And(...processCondition(variable, condition, Or, And)));
     }
   }
-  return [];
+  return assertions;
 };
 
-const buildAssertions = (
+export const buildAssertions = (
   variables: Record<string, NumberExpr>,
-  args: RangeFilter = {},
+  Or: (...args: Assertion[]) => Assertion,
+  And: (...args: Assertion[]) => Assertion,
+  args: Filter = {},
   user: RangeFilter = {}
-) => {
+): Assertion[] => {
   const variableRegistry = {} as Record<string, NumberExpr>;
   for (const name in variables) {
     const realName = variables[name].name() as string;
     variableRegistry[realName] = variables[name];
   }
-  const argsAssertions = processFilters(variableRegistry, args);
-  const userAssertions = processFilters(variableRegistry, user, true);
+  const argsAssertions = processFilter(variableRegistry, Or, And, args);
+  const userAssertions = processFilter(variableRegistry, Or, And, user, true);
   const assertions = [...argsAssertions, ...userAssertions];
   console.log(
     "assertions",
@@ -272,3 +306,27 @@ const result4 = await checker(
   { age: 16 }
 );
 console.log("result4", result4); // true
+
+// with OR filter
+const result5 = await checker(
+  {
+    OR: [{ alcoholLevel: { ge: 1, le: 5 } }, { alcoholLevel: { lt: 20 } }],
+    alcoholLevel: { ge: 2, lt: 10 },
+  },
+  { age: 17 }
+);
+console.log("result5", result5); // true
+
+// with OR condition
+const result6 = await checker(
+  {
+    alcoholLevel: {
+      OR: [
+        { ge: 20, lt: 10 },
+        { ge: 1, lt: 2 },
+      ],
+    },
+  },
+  { age: 16 }
+);
+console.log("result6", result6); // true
