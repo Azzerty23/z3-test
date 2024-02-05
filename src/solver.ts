@@ -142,28 +142,32 @@
 // -> alcohol level < 5° allowed between 16 and 18 years old
 
 // zmodel policy rules:
-// @@allow('read', (auth().age > 16 && alcoholLevel < 5) || auth().age > 18)
+// @@allow('read', inStock && ( (auth().age > 16 && alcoholLevel < 5) || auth().age > 18) )
 
 import { type Arith, type Bool, init } from "z3-solver";
 import { killThreads } from "./utils";
 
 async function checker(args: Filter, user?: any) {
   const { Context, em } = await init();
-  const { Solver, Int, Or, And } = Context("main");
+  const { Solver, Int, Bool, Or, And, isBool } = Context("main");
   const userAge = Int.const("user.age"); // to generate dynamically
   const alcoholLevel = Int.const("alcoholLevel"); // to generate dynamically
-  const variables = { userAge, alcoholLevel }; // to generate dynamically
+  const inStock = Bool.const("inStock"); // to generate dynamically
+  const variables = { userAge, alcoholLevel, inStock }; // to generate dynamically
   const solver = new Solver();
   console.log("args", args);
-  const assertions = buildAssertions(variables, Or, And, args, user);
+  const assertions = buildAssertions(variables, Or, And, isBool, args, user);
   solver.add(...assertions);
+  //   solver.add(inStock); // to generate dynamically
   solver.add(
+    inStock,
     Or(userAge.ge(18), And(userAge.ge(16), alcoholLevel.lt(5))) // to generate dynamically
   );
   if ((await solver.check()) === "sat") {
     const model = solver.model();
     console.log(`userAge=${model.get(userAge)}`);
     console.log(`alcoholLevel=${model.get(alcoholLevel)}`);
+    console.log(`inStock=${model.get(inStock)}`);
     await killThreads(em);
     return true;
   } else {
@@ -176,31 +180,45 @@ async function checker(args: Filter, user?: any) {
 type Operator = "eq" | "ne" | "lt" | "le" | "gt" | "ge";
 type NumericComparison = Partial<{ [k in Operator]: number }>;
 type NumericCondition = NumericComparison | number;
+type BoolCondition = boolean;
 type OrCondition = { OR: NumericCondition[] | OrCondition[] };
-type RangeFilter = Record<string, OrCondition | NumericCondition>;
+type RangeFilter = Record<
+  string,
+  OrCondition | NumericCondition | BoolCondition
+>;
 type OrFilter = { OR: RangeFilter[] | OrFilter[] };
 type Filter = RangeFilter | OrFilter;
 type Assertion = Bool<"main">;
 type NumberExpr = Arith<"main">;
+type Expr = NumberExpr | Assertion;
 
 const processCondition = (
-  variable: NumberExpr,
-  condition: NumericCondition | OrCondition,
+  variable: Expr,
+  condition: NumericCondition | OrCondition | BoolCondition,
   Or: (...args: Assertion[]) => Assertion,
-  And: (...args: Assertion[]) => Assertion
+  And: (...args: Assertion[]) => Assertion,
+  isBool: (expr: Expr) => expr is Bool<"main">
 ): Assertion[] => {
   const assertions: Assertion[] = [];
   if (typeof condition === "number") {
     assertions.push(variable.eq(condition));
-  } // handle OR condition
+  } else if (typeof condition === "boolean") {
+    assertions.push(variable.eq(condition));
+  }
+  // handle OR condition
   else if ("OR" in condition) {
     const orCondition = condition as OrCondition;
     const tempAssertions: Assertion[] = [];
     for (const condition of orCondition.OR) {
-      tempAssertions.push(...processCondition(variable, condition, Or, And));
+      tempAssertions.push(
+        ...processCondition(variable, condition, Or, And, isBool)
+      );
     }
     const orAssertion = Or(...tempAssertions);
     assertions.push(orAssertion);
+    // TODO: remove this condition as duplicated ?
+  } else if (isBool(variable)) {
+    assertions.push(variable);
   } else {
     const tempAssertions: Assertion[] = [];
     for (const [operator, value] of Object.entries(condition)) {
@@ -227,54 +245,79 @@ const processCondition = (
           throw new Error("Invalid operator");
       }
     }
-    const andAssertion = And(...tempAssertions);
-    assertions.push(andAssertion);
+
+    // avoid empty assertions in case of comparison object
+    if (tempAssertions.length > 1) {
+      const andAssertion = And(...tempAssertions);
+      assertions.push(andAssertion);
+    } else if (tempAssertions.length === 1) {
+      assertions.push(...tempAssertions);
+    }
   }
   return assertions;
 };
 
 const processFilter = (
-  variables: Record<string, NumberExpr>,
+  variables: Record<string, Expr>,
   Or: (...args: Assertion[]) => Assertion,
   And: (...args: Assertion[]) => Assertion,
+  isBool: (expr: Expr) => expr is Bool<"main">,
   filter: Filter,
   isUserFilter: boolean = false
 ): Assertion[] => {
   const assertions: Assertion[] = [];
   if ("OR" in filter) {
     const orFilter = filter as OrFilter;
-    console.log("orFilter", orFilter.OR);
     const tempAssertions: Assertion[] = [];
     for (const filter of orFilter.OR) {
-      tempAssertions.push(...processFilter(variables, Or, And, filter));
+      tempAssertions.push(...processFilter(variables, Or, And, isBool, filter));
     }
     const orAssertion = Or(...tempAssertions);
     assertions.push(orAssertion);
   }
+  const tempAssertions: Assertion[] = [];
   for (const [property, condition] of Object.entries(filter)) {
     const renamedProperty = isUserFilter ? `user.${property}` : property;
     const variable = variables[renamedProperty];
     if (variable) {
-      assertions.push(And(...processCondition(variable, condition, Or, And)));
+      tempAssertions.push(
+        ...processCondition(variable, condition, Or, And, isBool)
+      );
     }
   }
+  // avoid empty assertions in case of unique value or boolean
+  if (tempAssertions.length > 1) {
+    const andAssertion = And(...tempAssertions);
+    assertions.push(andAssertion);
+  } else if (tempAssertions.length === 1) {
+    assertions.push(...tempAssertions);
+  }
+
   return assertions;
 };
 
 export const buildAssertions = (
-  variables: Record<string, NumberExpr>,
+  variables: Record<string, Expr>,
   Or: (...args: Assertion[]) => Assertion,
   And: (...args: Assertion[]) => Assertion,
+  isBool: (expr: Expr) => expr is Bool<"main">,
   args: Filter = {},
   user: RangeFilter = {}
 ): Assertion[] => {
-  const variableRegistry = {} as Record<string, NumberExpr>;
+  const variableRegistry = {} as Record<string, Expr>;
   for (const name in variables) {
     const realName = variables[name].name() as string;
     variableRegistry[realName] = variables[name];
   }
-  const argsAssertions = processFilter(variableRegistry, Or, And, args);
-  const userAssertions = processFilter(variableRegistry, Or, And, user, true);
+  const argsAssertions = processFilter(variableRegistry, Or, And, isBool, args);
+  const userAssertions = processFilter(
+    variableRegistry,
+    Or,
+    And,
+    isBool,
+    user,
+    true
+  );
   const assertions = [...argsAssertions, ...userAssertions];
   console.log(
     "assertions",
@@ -288,6 +331,10 @@ export const buildAssertions = (
 // Without args
 const result = await checker({});
 console.log("result", result); // true -> however age should be defined I guess
+
+// One arg
+const result1 = await checker({ alcoholLevel: 1 });
+console.log("result1", result1); // true -> however age should be defined I guess
 
 // With simple args
 const result2 = await checker({ alcoholLevel: { ge: 10, lt: 9 } });
@@ -330,3 +377,25 @@ const result6 = await checker(
   { age: 16 }
 );
 console.log("result6", result6); // true
+
+// with boolean conditions
+const result7 = await checker(
+  {
+    alcoholLevel: 0,
+    inStock: false,
+  },
+  { age: 30 }
+);
+console.log("result7", result7); // false
+
+// with boolean conditions and OR
+const result8 = await checker(
+  {
+    OR: [
+      { alcoholLevel: 0, inStock: false },
+      { alcoholLevel: 100, inStock: true },
+    ],
+  },
+  { age: 15 }
+);
+console.log("result8", result8); // false
