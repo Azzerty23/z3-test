@@ -144,23 +144,26 @@
 // zmodel policy rules:
 // @@allow('read', inStock && ( (auth().age > 16 && alcoholLevel < 5) || auth().age > 18) )
 
-import { type Arith, type Bool, init } from "z3-solver";
+import { type Arith, type Bool, init, Context } from "z3-solver";
 import { killThreads } from "./utils";
 
 async function checker(args: Filter, user?: any) {
   const { Context, em } = await init();
-  const { Solver, Int, Bool, Or, And, isBool } = Context("main");
+  const z3 = Context("main");
+  const { Solver, Int, Bool, Or, And } = z3;
+
+  // create variables
   const userAge = Int.const("user.age"); // to generate dynamically
   const alcoholLevel = Int.const("alcoholLevel"); // to generate dynamically
   const inStock = Bool.const("inStock"); // to generate dynamically
   const variables = { userAge, alcoholLevel, inStock }; // to generate dynamically
+
   const solver = new Solver();
   console.log("args", args);
-  const assertions = buildAssertions(variables, Or, And, isBool, args, user);
+  const assertions = buildAssertions(variables, args, user, z3);
   solver.add(...assertions);
-  //   solver.add(inStock); // to generate dynamically
   solver.add(
-    inStock,
+    inStock, // to generate dynamically
     Or(userAge.ge(18), And(userAge.ge(16), alcoholLevel.lt(5))) // to generate dynamically
   );
   if ((await solver.check()) === "sat") {
@@ -195,29 +198,22 @@ type Expr = NumberExpr | Assertion;
 const processCondition = (
   variable: Expr,
   condition: NumericCondition | OrCondition | BoolCondition,
-  Or: (...args: Assertion[]) => Assertion,
-  And: (...args: Assertion[]) => Assertion,
-  isBool: (expr: Expr) => expr is Bool<"main">
+  z3: Context<"main">
 ): Assertion[] => {
   const assertions: Assertion[] = [];
   if (typeof condition === "number") {
     assertions.push(variable.eq(condition));
   } else if (typeof condition === "boolean") {
     assertions.push(variable.eq(condition));
-  }
-  // handle OR condition
-  else if ("OR" in condition) {
+  } else if ("OR" in condition) {
     const orCondition = condition as OrCondition;
     const tempAssertions: Assertion[] = [];
     for (const condition of orCondition.OR) {
-      tempAssertions.push(
-        ...processCondition(variable, condition, Or, And, isBool)
-      );
+      tempAssertions.push(...processCondition(variable, condition, z3));
     }
-    const orAssertion = Or(...tempAssertions);
+    const orAssertion = z3.Or(...tempAssertions);
     assertions.push(orAssertion);
-    // TODO: remove this condition as duplicated ?
-  } else if (isBool(variable)) {
+  } else if (z3.isBool(variable)) {
     assertions.push(variable);
   } else {
     const tempAssertions: Assertion[] = [];
@@ -246,9 +242,9 @@ const processCondition = (
       }
     }
 
-    // avoid empty assertions in case of comparison object
+    // avoid empty assertions in case of comparison object like { ge: 1, le: 2 }
     if (tempAssertions.length > 1) {
-      const andAssertion = And(...tempAssertions);
+      const andAssertion = z3.And(...tempAssertions);
       assertions.push(andAssertion);
     } else if (tempAssertions.length === 1) {
       assertions.push(...tempAssertions);
@@ -259,9 +255,7 @@ const processCondition = (
 
 const processFilter = (
   variables: Record<string, Expr>,
-  Or: (...args: Assertion[]) => Assertion,
-  And: (...args: Assertion[]) => Assertion,
-  isBool: (expr: Expr) => expr is Bool<"main">,
+  z3: Context<"main">,
   filter: Filter,
   isUserFilter: boolean = false
 ): Assertion[] => {
@@ -270,9 +264,9 @@ const processFilter = (
     const orFilter = filter as OrFilter;
     const tempAssertions: Assertion[] = [];
     for (const filter of orFilter.OR) {
-      tempAssertions.push(...processFilter(variables, Or, And, isBool, filter));
+      tempAssertions.push(...processFilter(variables, z3, filter));
     }
-    const orAssertion = Or(...tempAssertions);
+    const orAssertion = z3.Or(...tempAssertions);
     assertions.push(orAssertion);
   }
   const tempAssertions: Assertion[] = [];
@@ -280,14 +274,12 @@ const processFilter = (
     const renamedProperty = isUserFilter ? `user.${property}` : property;
     const variable = variables[renamedProperty];
     if (variable) {
-      tempAssertions.push(
-        ...processCondition(variable, condition, Or, And, isBool)
-      );
+      tempAssertions.push(...processCondition(variable, condition, z3));
     }
   }
   // avoid empty assertions in case of unique value or boolean
   if (tempAssertions.length > 1) {
-    const andAssertion = And(...tempAssertions);
+    const andAssertion = z3.And(...tempAssertions);
     assertions.push(andAssertion);
   } else if (tempAssertions.length === 1) {
     assertions.push(...tempAssertions);
@@ -298,26 +290,17 @@ const processFilter = (
 
 export const buildAssertions = (
   variables: Record<string, Expr>,
-  Or: (...args: Assertion[]) => Assertion,
-  And: (...args: Assertion[]) => Assertion,
-  isBool: (expr: Expr) => expr is Bool<"main">,
   args: Filter = {},
-  user: RangeFilter = {}
+  user: RangeFilter = {},
+  z3: Context<"main">
 ): Assertion[] => {
   const variableRegistry = {} as Record<string, Expr>;
   for (const name in variables) {
     const realName = variables[name].name() as string;
     variableRegistry[realName] = variables[name];
   }
-  const argsAssertions = processFilter(variableRegistry, Or, And, isBool, args);
-  const userAssertions = processFilter(
-    variableRegistry,
-    Or,
-    And,
-    isBool,
-    user,
-    true
-  );
+  const argsAssertions = processFilter(variableRegistry, z3, args);
+  const userAssertions = processFilter(variableRegistry, z3, user, true);
   const assertions = [...argsAssertions, ...userAssertions];
   console.log(
     "assertions",
@@ -396,6 +379,18 @@ const result8 = await checker(
       { alcoholLevel: 100, inStock: true },
     ],
   },
-  { age: 15 }
+  { age: 16 }
 );
 console.log("result8", result8); // false
+
+// with partial condition on user
+const result9 = await checker(
+  {
+    OR: [
+      { alcoholLevel: 0, inStock: false },
+      { alcoholLevel: 100, inStock: true, "user.age": { lt: 18 } },
+    ],
+  }
+  // { age: 16 } // age should not be in policy in the first place
+);
+console.log("result9", result9); // false
